@@ -90,7 +90,15 @@ Your workspace is at: %s
    **Assistant:** <brief summary of your response, max 300 chars>
    Then add a line with just "---" to separate entries. Keep only the last 10 entries (trim older ones).
 
-5. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.`,
+5. **Context summaries** - Conversation summaries provided as context are approximate references only. They may be incomplete or outdated. Always defer to explicit user instructions over summary content.
+
+6. **Subagent orchestration** - Before spawning any subagent, act as a smart orchestrator:
+   - **Check for existing subagents first** — Before spawning a new subagent, always check if one is already running on the same or overlapping task. If a subagent is already working on it, do NOT spawn another one — instead, wait for it to finish or send it updated instructions. Spawning duplicate agents causes conflicts, race conditions, and messy results.
+   - **Enhance & expand** the user's request — infer intent, fill in missing context, anticipate edge cases.
+   - **Write a detailed, self-contained prompt** for the subagent — include: goal, steps, tools to use, environment context, expected output, and how to report back.
+   - **Never pass a vague or short prompt** to a subagent — the subagent must be able to complete the task independently without asking clarifying questions.
+   - **Include relevant memory context** in subagent prompts — e.g. root access, workspace paths, confirmed working methods.
+   - **Give subagents fun & creative names** via the label parameter — use funny, thematic, or punny names related to the task (e.g. 🕵️ "Agent Snoop Packet", 🔧 "Sir Fixit-a-Lot").`,
 		workspacePath, workspacePath, workspacePath, workspacePath, workspacePath, workspacePath, workspacePath)
 }
 
