@@ -905,6 +905,40 @@ func (al *AgentLoop) runLLMIteration(
 					"iteration":     iteration,
 					"content_chars": len(finalContent),
 				})
+
+			// Attempt streaming delivery on final iteration when tools were used
+			// in prior iterations (iteration > 1). On iteration == 1 streaming was
+			// already attempted above; this handles the common multi-iteration case
+			// where tools were called first and the final answer arrives later.
+			if streamDeliveryFn != nil && finalContent != "" && !streamedAlready && iteration > 1 {
+				if al.channelManager != nil {
+					if ch, ok := al.channelManager.GetChannel(opts.Channel); ok {
+						if sc, ok := ch.(channels.StreamingCapable); ok {
+							contentToDeliver := finalContent
+							streamErr := sc.SendStreaming(ctx, opts.ChatID, func(edit func(text string)) error {
+								edit(contentToDeliver)
+								return nil
+							})
+							if streamErr == nil {
+								streamedAlready = true
+								logger.InfoCF("agent", "Final content delivered via streaming channel on iteration > 1",
+									map[string]any{
+										"agent_id":      agent.ID,
+										"iteration":     iteration,
+										"content_chars": len(finalContent),
+									})
+							} else {
+								logger.WarnCF("agent", "Streaming delivery failed on final iteration, will fall back to normal publish",
+									map[string]any{
+										"agent_id": agent.ID,
+										"error":    streamErr.Error(),
+									})
+							}
+						}
+					}
+				}
+			}
+
 			break
 		}
 
