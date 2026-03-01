@@ -30,6 +30,7 @@ import (
 	"thor/pkg/config"
 	"thor/pkg/cron"
 	"thor/pkg/devices"
+	"thor/pkg/gitdiff"
 	"thor/pkg/health"
 	"thor/pkg/heartbeat"
 	"thor/pkg/logger"
@@ -71,10 +72,24 @@ func diagnoseUnplannedRestart() string {
 
 	// --- Detection rules (most specific first) ---
 
-	// safe-deploy
+	// safe-deploy — include git diff summary of what changed
 	if strings.Contains(combinedLower, "safe-deploy") ||
 		strings.Contains(combinedLower, "deploying new thor binary") ||
 		strings.Contains(combinedLower, "safe deploy") {
+		// Try to get the git diff summary to show what changed
+		diffSummary, err := gitdiff.GenerateSummary(gitdiff.ThorRepoPath)
+		if err == nil && diffSummary != nil {
+			commitInfo := ""
+			if len(diffSummary.CommitLog) > 0 && diffSummary.CommitLog[0] != "(no new commits since last deploy)" {
+				commitInfo = "\n📦 New: " + strings.Join(diffSummary.CommitLog, ", ")
+			}
+			if diffSummary.FilesChanged > 0 {
+				commitInfo += fmt.Sprintf("\n📊 %d files changed (+%d/-%d lines)", diffSummary.FilesChanged, diffSummary.Insertions, diffSummary.Deletions)
+			}
+			if commitInfo != "" {
+				return "Restarted via safe-deploy ✅" + commitInfo
+			}
+		}
 		return "Restarted via safe-deploy ✅"
 	}
 
@@ -328,6 +343,28 @@ func gatewayCmd(debug bool) error {
 		fmt.Printf("Error starting cron service: %v\n", err)
 	}
 	fmt.Println("✓ Cron service started")
+
+	// Edison 🤖: Wire weekly analytics reporter (Brain Loop Cycle 2)
+	// Sends a tool usage analytics report every Sunday at 09:00 via Telegram.
+	go func() {
+		analyticsReporter := tools.NewAnalyticsReporter(msgBus, "telegram", "1930168837")
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		var lastReportDay int // track last day we sent the report
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case t := <-ticker.C:
+				// Fire on Sundays at 09:00 local time
+				if t.Weekday() == time.Sunday && t.Hour() == 9 && t.YearDay() != lastReportDay {
+					lastReportDay = t.YearDay()
+					analyticsReporter.Run(ctx)
+				}
+			}
+		}
+	}()
+	fmt.Println("✓ Weekly analytics reporter scheduled (Sundays 09:00)")
 
 	if err := heartbeatService.Start(); err != nil {
 		fmt.Printf("Error starting heartbeat service: %v\n", err)

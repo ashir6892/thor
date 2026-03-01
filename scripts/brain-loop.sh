@@ -106,7 +106,7 @@ case "$LAST_STATE" in
 
     THOR_BIN="$HOME/thor/build/thor"
     if [ -f "$THOR_BIN" ]; then
-      "$THOR_BIN" -message "ARCHIMEDES CYCLE: Read BRAIN_LOOP.md at ~/.thor/workspace/memory/BRAIN_LOOP.md. Pick the highest priority PENDING idea. Write a detailed implementation plan. Update BRAIN_LOOP.md: mark the chosen idea status as 'archimedes_selected', write your debate note with WHY this idea, HOW to implement it (Go code plan), what files to change. Then set BRAIN_LOOP_STATE to 'archimedes_done'. Sign your note as Archimedes." 2>> "$LOG_FILE"
+      "$THOR_BIN" agent -m "ARCHIMEDES CYCLE: Read BRAIN_LOOP.md at ~/.thor/workspace/memory/BRAIN_LOOP.md. Pick the highest priority PENDING idea. Write a detailed implementation plan. Update BRAIN_LOOP.md: mark the chosen idea status as 'archimedes_selected', write your debate note with WHY this idea, HOW to implement it (Go code plan), what files to change. Then set BRAIN_LOOP_STATE to 'archimedes_done'. Sign your note as Archimedes." 2>> "$LOG_FILE"
     fi
     ;;
 
@@ -122,7 +122,7 @@ case "$LAST_STATE" in
 
     THOR_BIN="$HOME/thor/build/thor"
     if [ -f "$THOR_BIN" ]; then
-      "$THOR_BIN" -message "EDISON CYCLE: Read BRAIN_LOOP.md at ~/.thor/workspace/memory/BRAIN_LOOP.md. Find the idea marked 'archimedes_selected'. Implement it fully: write Go code, edit the right files in ~/thor/, run 'go test ./...' to verify, then deploy using ~/thor/scripts/safe-deploy.sh. IMPORTANT SAFETY RULES: (1) You MUST use ~/thor/scripts/safe-deploy.sh for all deploys - NEVER deploy manually. (2) After deploying, wait for the health check to complete before updating BRAIN_LOOP_STATE. (3) If safe-deploy.sh fails, set BRAIN_LOOP_STATE to 'idle' and report the failure via Telegram. After successful deploy, update BRAIN_LOOP.md: mark that idea as 'completed' in the queue table AND move it to the Completed Upgrades table. Set BRAIN_LOOP_STATE to 'edison_done'. Send a Telegram message to chat 1930168837 summarizing what was built and how it works. Sign your note as Edison." 2>> "$LOG_FILE"
+      "$THOR_BIN" agent -m "EDISON CYCLE: Read BRAIN_LOOP.md at ~/.thor/workspace/memory/BRAIN_LOOP.md. Find the idea marked 'archimedes_selected'. Implement it fully: write Go code, edit the right files in ~/thor/, run 'go test ./...' to verify, then deploy using ~/thor/scripts/safe-deploy.sh. IMPORTANT SAFETY RULES: (1) You MUST use ~/thor/scripts/safe-deploy.sh for all deploys - NEVER deploy manually. (2) After deploying, wait for the health check to complete before updating BRAIN_LOOP_STATE. (3) If safe-deploy.sh fails, set BRAIN_LOOP_STATE to 'idle' and report the failure via Telegram. After successful deploy, update BRAIN_LOOP.md: mark that idea as 'completed' in the queue table AND move it to the Completed Upgrades table. Set BRAIN_LOOP_STATE to 'edison_done'. Send a Telegram message to chat 1930168837 summarizing what was built and how it works. Sign your note as Edison." 2>> "$LOG_FILE"
     fi
     ;;
 

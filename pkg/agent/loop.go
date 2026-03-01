@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,7 @@ import (
 	"thor/pkg/channels"
 	"thor/pkg/config"
 	"thor/pkg/constants"
+	"thor/pkg/gitdiff"
 	"thor/pkg/logger"
 	"thor/pkg/media"
 	"thor/pkg/providers"
@@ -1312,6 +1314,17 @@ func (al *AgentLoop) GetStartupInfo() map[string]any {
 	return info
 }
 
+// GetDeployDiff returns a formatted summary of what changed since the last deploy.
+// Edison 🤖: Added as part of the autonomous upgrade loop (git diff summary feature).
+// Returns a plain-text summary suitable for logging, or an error message.
+func (al *AgentLoop) GetDeployDiff() string {
+	summary, err := gitdiff.GenerateSummary(gitdiff.ThorRepoPath)
+	if err != nil {
+		return fmt.Sprintf("(git diff unavailable: %v)", err)
+	}
+	return gitdiff.FormatSummaryPlain(summary)
+}
+
 // formatMessagesForLog formats messages for logging
 func formatMessagesForLog(messages []providers.Message) string {
 	if len(messages) == 0 {
@@ -1579,6 +1592,82 @@ func (al *AgentLoop) handleCommand(ctx context.Context, msg bus.InboundMessage) 
 		default:
 			return fmt.Sprintf("Unknown switch target: %s", target), true
 		}
+	}
+
+	// /gitdiff — show what changed in the last deploy
+	// Edison 🤖: Added as part of the autonomous upgrade loop (git diff summary feature)
+	if cmd == "/gitdiff" {
+		summary, err := gitdiff.GenerateSummary(gitdiff.ThorRepoPath)
+		if err != nil {
+			return fmt.Sprintf("❌ Could not generate git diff: %v", err), true
+		}
+
+		// Use plain format for CLI, markdown for other channels
+		if msg.Channel == "cli" {
+			return gitdiff.FormatSummaryPlain(summary), true
+		}
+		return gitdiff.FormatSummary(summary), true
+	}
+
+	// /analytics [hours] — show tool usage analytics report
+	// Edison 🤖: Added as part of Brain Loop Cycle 2 (Tool Analytics + Auto-Optimization)
+	if cmd == "/analytics" {
+		hours := 168 // default: last 7 days
+		if len(args) > 0 {
+			if n, err := strconv.Atoi(args[0]); err == nil && n > 0 {
+				hours = n
+			}
+		}
+		report, err := tools.GenerateReport(hours)
+		if err != nil {
+			return fmt.Sprintf("❌ Analytics unavailable: %v", err), true
+		}
+		return tools.FormatReport(report), true
+	}
+
+	// /personality — show detected personality profile for current session
+	// Edison 🤖: Added as part of Brain Loop Cycle 3 (Adaptive Personality Profiles)
+	if cmd == "/personality" {
+		// Resolve the agent and session key for this message, same as the main handler.
+		route := al.registry.ResolveRoute(routing.RouteInput{
+			Channel:    msg.Channel,
+			AccountID:  msg.Metadata["account_id"],
+			Peer:       extractPeer(msg),
+			ParentPeer: extractParentPeer(msg),
+			GuildID:    msg.Metadata["guild_id"],
+			TeamID:     msg.Metadata["team_id"],
+		})
+		sessionKey := route.SessionKey
+		if msg.SessionKey != "" && strings.HasPrefix(msg.SessionKey, "agent:") {
+			sessionKey = msg.SessionKey
+		}
+		agent, ok := al.registry.GetAgent(route.AgentID)
+		if !ok {
+			agent = al.registry.GetDefaultAgent()
+		}
+		var history []providers.Message
+		if agent != nil && sessionKey != "" {
+			history = agent.Sessions.GetHistory(sessionKey)
+		}
+		profile := DetectPersonality(history)
+		if profile == nil {
+			return "🧠 Not enough conversation history yet (need at least 3 messages). Keep chatting!", true
+		}
+		hint := profile.FormatHint()
+		if hint == "" {
+			hint = "(no style adjustments — balanced communication style)"
+		}
+		return fmt.Sprintf(
+			"🧠 *Detected Communication Style*\n\n"+
+				"📏 Verbosity: `%s` (avg msg: %d chars)\n"+
+				"🔧 Technicality: `%s`\n"+
+				"🎭 Formality: `%s`\n\n"+
+				"💡 Active hint: _%s_",
+			profile.Verbosity, profile.AvgUserMsgLen,
+			profile.Technicality,
+			profile.Formality,
+			strings.TrimSpace(hint),
+		), true
 	}
 
 	return "", false

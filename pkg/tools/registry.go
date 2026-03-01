@@ -105,6 +105,9 @@ func (r *ToolRegistry) ExecuteWithContext(
 			})
 	}
 
+	// Record analytics asynchronously — never blocks tool execution
+	RecordToolAnalytics(name, duration, result.IsError, len(result.ForLLM))
+
 	return result
 }
 

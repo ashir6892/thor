@@ -419,6 +419,14 @@ func (cb *ContextBuilder) BuildMessages(
 	// Build short dynamic context (time, runtime, session) — changes per request
 	dynamicCtx := cb.buildDynamicContext(channel, chatID)
 
+	// Adaptive Personality: detect user communication style from history and inject a hint.
+	// Safe: if DetectPersonality returns nil or FormatHint returns "", dynamicCtx is unchanged.
+	if profile := DetectPersonality(history); profile != nil {
+		if hint := profile.FormatHint(); hint != "" {
+			dynamicCtx += hint
+		}
+	}
+
 	// Compose a single system message: static (cached) + dynamic + optional summary.
 	// Keeping all system content in one message ensures every provider adapter can
 	// extract it correctly (Anthropic adapter -> top-level system param,
