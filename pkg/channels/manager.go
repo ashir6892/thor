@@ -92,6 +92,18 @@ type asyncTask struct {
 	cancel context.CancelFunc
 }
 
+// ConsumePlaceholder removes and returns the placeholder ID for a channel+chatID pair.
+// Returns ("", false) if no placeholder is registered.
+func (m *Manager) ConsumePlaceholder(channel, chatID string) (string, bool) {
+	key := channel + ":" + chatID
+	if v, loaded := m.placeholders.LoadAndDelete(key); loaded {
+		if entry, ok := v.(placeholderEntry); ok && entry.id != "" {
+			return entry.id, true
+		}
+	}
+	return "", false
+}
+
 // RecordPlaceholder registers a placeholder message for later editing.
 // Implements PlaceholderRecorder.
 func (m *Manager) RecordPlaceholder(channel, chatID, placeholderID string) {

@@ -32,6 +32,22 @@ type LLMProvider interface {
 	GetDefaultModel() string
 }
 
+// StreamingProvider is an optional extension of LLMProvider for providers
+// that support token-by-token streaming. The callback is called for each
+// text chunk as it arrives. Tool calls are not streamed; if the model
+// returns tool calls the full response is returned via the normal Chat path.
+type StreamingProvider interface {
+	LLMProvider
+	StreamChat(
+		ctx context.Context,
+		messages []Message,
+		tools []ToolDefinition,
+		model string,
+		options map[string]any,
+		onChunk func(chunk string),
+	) (*LLMResponse, error)
+}
+
 type StatefulProvider interface {
 	LLMProvider
 	Close()

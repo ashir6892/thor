@@ -147,10 +147,174 @@ func (p *AntigravityProvider) Chat(
 	return llmResp, nil
 }
 
+// StreamChat implements StreamingProvider.StreamChat for AntigravityProvider.
+// It streams the response token-by-token via the onChunk callback.
+// If the model returns tool calls, streaming stops and the full accumulated
+// response is returned (tool calls are never streamed incrementally).
+func (p *AntigravityProvider) StreamChat(
+	ctx context.Context,
+	messages []Message,
+	tools []ToolDefinition,
+	model string,
+	options map[string]any,
+	onChunk func(chunk string),
+) (*LLMResponse, error) {
+	accessToken, projectID, err := p.tokenSource()
+	if err != nil {
+		return nil, fmt.Errorf("antigravity auth: %w", err)
+	}
+
+	if model == "" || model == "antigravity" || model == "google-antigravity" {
+		model = antigravityDefaultModel
+	}
+	model = strings.TrimPrefix(model, "google-antigravity/")
+	model = strings.TrimPrefix(model, "antigravity/")
+
+	innerRequest := p.buildRequest(messages, tools, model, options)
+
+	envelope := map[string]any{
+		"project":     projectID,
+		"model":       model,
+		"request":     innerRequest,
+		"requestType": "agent",
+		"userAgent":   antigravityUserAgent,
+		"requestId":   fmt.Sprintf("agent-%d-%s", time.Now().UnixMilli(), randomString(9)),
+	}
+
+	bodyBytes, err := json.Marshal(envelope)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling request: %w", err)
+	}
+
+	apiURL := fmt.Sprintf("%s/v1internal:streamGenerateContent?alt=sse", antigravityBaseURL)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", apiURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+
+	clientMetadata, _ := json.Marshal(map[string]string{
+		"ideType":    "IDE_UNSPECIFIED",
+		"platform":   "PLATFORM_UNSPECIFIED",
+		"pluginType": "GEMINI",
+	})
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("User-Agent", fmt.Sprintf("antigravity/%s linux/amd64", antigravityVersion))
+	req.Header.Set("X-Goog-Api-Client", antigravityXGoogClient)
+	req.Header.Set("Client-Metadata", string(clientMetadata))
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("antigravity API call: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, p.parseAntigravityError(resp.StatusCode, respBody)
+	}
+
+	// Stream SSE line by line, calling onChunk for each text delta
+	var contentParts []string
+	var toolCalls []ToolCall
+	var usage *UsageInfo
+	var finishReason string
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var sseChunk struct {
+			Response antigravityJSONResponse `json:"response"`
+		}
+		if err := json.Unmarshal([]byte(data), &sseChunk); err != nil {
+			continue
+		}
+		r := sseChunk.Response
+
+		for _, candidate := range r.Candidates {
+			for _, part := range candidate.Content.Parts {
+				if part.Text != "" {
+					contentParts = append(contentParts, part.Text)
+					if onChunk != nil {
+						onChunk(part.Text)
+					}
+				}
+				if part.FunctionCall != nil {
+					argumentsJSON, _ := json.Marshal(part.FunctionCall.Args)
+					toolCalls = append(toolCalls, ToolCall{
+						ID:        fmt.Sprintf("call_%s_%d", part.FunctionCall.Name, time.Now().UnixNano()),
+						Name:      part.FunctionCall.Name,
+						Arguments: part.FunctionCall.Args,
+						Function: &FunctionCall{
+							Name:      part.FunctionCall.Name,
+							Arguments: string(argumentsJSON),
+							ThoughtSignature: extractPartThoughtSignature(
+								part.ThoughtSignature,
+								part.ThoughtSignatureSnake,
+							),
+						},
+					})
+				}
+			}
+			if candidate.FinishReason != "" {
+				finishReason = candidate.FinishReason
+			}
+		}
+
+		if r.UsageMetadata.TotalTokenCount > 0 {
+			usage = &UsageInfo{
+				PromptTokens:     r.UsageMetadata.PromptTokenCount,
+				CompletionTokens: r.UsageMetadata.CandidatesTokenCount,
+				TotalTokens:      r.UsageMetadata.TotalTokenCount,
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil && err != io.EOF {
+		// Non-fatal: return what we have
+		logger.WarnCF("provider.antigravity", "Stream scanner error", map[string]any{"error": err.Error()})
+	}
+
+	mappedFinish := "stop"
+	if len(toolCalls) > 0 {
+		mappedFinish = "tool_calls"
+	}
+	if finishReason == "MAX_TOKENS" {
+		mappedFinish = "length"
+	}
+
+	llmResp := &LLMResponse{
+		Content:      strings.Join(contentParts, ""),
+		ToolCalls:    toolCalls,
+		FinishReason: mappedFinish,
+		Usage:        usage,
+	}
+
+	if llmResp.Content == "" && len(llmResp.ToolCalls) == 0 {
+		return nil, fmt.Errorf(
+			"antigravity: model returned an empty streaming response",
+		)
+	}
+
+	return llmResp, nil
+}
+
 // GetDefaultModel returns the default model identifier.
 func (p *AntigravityProvider) GetDefaultModel() string {
 	return antigravityDefaultModel
 }
+
+
 
 // --- Request building ---
 

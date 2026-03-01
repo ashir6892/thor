@@ -9,6 +9,14 @@ type TypingCapable interface {
 	StartTyping(ctx context.Context, chatID string) (stop func(), err error)
 }
 
+// StreamingCapable — channels that support progressive message editing (streaming).
+// SendStreaming sends an initial placeholder, then calls streamFn with an edit
+// callback that updates the message as content arrives. The final state is
+// committed on completion.
+type StreamingCapable interface {
+	SendStreaming(ctx context.Context, chatID string, streamFn func(edit func(text string)) error) error
+}
+
 // MessageEditor — channels that can edit an existing message.
 // messageID is always string; channels convert platform-specific types internally.
 type MessageEditor interface {

@@ -54,6 +54,7 @@ type processOptions struct {
 	EnableSummary   bool   // Whether to trigger summarization
 	SendResponse    bool   // Whether to send response via bus
 	NoHistory       bool   // If true, don't load session history (for heartbeat)
+	UseStreaming     bool   // If true, attempt streaming delivery for final response
 }
 
 // defaultResponse is an internal sentinel used only for logging — it is NEVER sent to the user.
@@ -412,6 +413,7 @@ func (al *AgentLoop) processMessage(ctx context.Context, msg bus.InboundMessage)
 		DefaultResponse: defaultResponse,
 		EnableSummary:   true,
 		SendResponse:    false,
+		UseStreaming:     true,
 	})
 }
 
@@ -509,21 +511,36 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	// 3. Save user message to session
 	agent.Sessions.AddMessage(opts.SessionKey, "user", opts.UserMessage)
 
+	// Determine if streaming delivery is possible for this request.
+	// Streaming is only used when:
+	//   - UseStreaming is requested
+	//   - The provider implements StreamingProvider
+	//   - The channel implements StreamingCapable
+	//   - We are not in an internal channel (cli, system, etc.)
+	var streamDelivery func(ctx context.Context, messages []providers.Message, toolDefs []providers.ToolDefinition) (string, bool, error)
+	if opts.UseStreaming && !constants.IsInternalChannel(opts.Channel) {
+		if sp, ok := agent.Provider.(providers.StreamingProvider); ok {
+			if al.channelManager != nil {
+				if ch, ok := al.channelManager.GetChannel(opts.Channel); ok {
+					if sc, ok := ch.(channels.StreamingCapable); ok {
+						channelCapture := opts.Channel
+						chatIDCapture := opts.ChatID
+						streamDelivery = func(ctx context.Context, msgs []providers.Message, toolDefs []providers.ToolDefinition) (string, bool, error) {
+							return al.doStreamDelivery(ctx, agent, sc, channelCapture, chatIDCapture, msgs, toolDefs, sp)
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// 4. Run LLM iteration loop
-	finalContent, iteration, err := al.runLLMIteration(ctx, agent, messages, opts)
+	finalContent, iteration, streamedAlready, err := al.runLLMIteration(ctx, agent, messages, opts, streamDelivery)
 	if err != nil {
 		return "", err
 	}
 
-	// If last tool had ForUser content and we already sent it, we might not need to send final response
-	// This is controlled by the tool's Silent flag and ForUser content
-
 	// 5. Handle empty response
-	// Only fall back to the default "no response" placeholder when the message
-	// tool has NOT already sent a reply to the user.  If the message tool DID
-	// send a reply and the LLM returned nothing, we leave finalContent empty so
-	// that the caller (Run) knows it can stay silent — no need to echo the
-	// placeholder back to the user.
 	if finalContent == "" {
 		messageSent := false
 		if tool, ok := agent.Tools.Get("message"); ok {
@@ -534,9 +551,6 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 		if !messageSent {
 			finalContent = opts.DefaultResponse
 		}
-		// If messageSent && finalContent == "", leave it empty.
-		// The Run() loop will see an empty response and skip publishing,
-		// which is correct because the message tool already handled delivery.
 	}
 
 	// 6. Save final assistant message to session (never save the internal sentinel)
@@ -553,7 +567,8 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	}
 
 	// 8. Optional: send response via bus (only if there's actual content to send)
-	if opts.SendResponse && finalContent != "" {
+	// Skip if already delivered via streaming
+	if opts.SendResponse && finalContent != "" && !streamedAlready {
 		al.bus.PublishOutbound(ctx, bus.OutboundMessage{
 			Channel: opts.Channel,
 			ChatID:  opts.ChatID,
@@ -565,11 +580,19 @@ func (al *AgentLoop) runAgentLoop(ctx context.Context, agent *AgentInstance, opt
 	responsePreview := utils.Truncate(finalContent, 120)
 	logger.InfoCF("agent", fmt.Sprintf("Response: %s", responsePreview),
 		map[string]any{
-			"agent_id":     agent.ID,
-			"session_key":  opts.SessionKey,
-			"iterations":   iteration,
-			"final_length": len(finalContent),
+			"agent_id":       agent.ID,
+			"session_key":    opts.SessionKey,
+			"iterations":     iteration,
+			"final_length":   len(finalContent),
+			"streamed":       streamedAlready,
 		})
+
+	// When content was delivered via streaming, return empty string so the
+	// Run() loop doesn't try to publish it again via the bus.
+	// Session saving already used the real finalContent above.
+	if streamedAlready {
+		return "", nil
+	}
 
 	return finalContent, nil
 }
@@ -632,14 +655,20 @@ func (al *AgentLoop) handleReasoning(ctx context.Context, reasoningContent, chan
 // tool calls (Goal Completion Detection — approach #2).  A hard cap
 // (agent.MaxIterations) still exists as a safety net, but the normal exit
 // path is the LLM choosing to stop calling tools.
+//
+// streamDeliveryFn is optional. When non-nil and the final iteration has no
+// tool calls, it is called to deliver the response via streaming (e.g. Telegram
+// progressive message editing). Returns (content, iteration, streamedAlready, error).
 func (al *AgentLoop) runLLMIteration(
 	ctx context.Context,
 	agent *AgentInstance,
 	messages []providers.Message,
 	opts processOptions,
-) (string, int, error) {
+	streamDeliveryFn func(ctx context.Context, messages []providers.Message, toolDefs []providers.ToolDefinition) (string, bool, error),
+) (string, int, bool, error) {
 	iteration := 0
 	var finalContent string
+	streamedAlready := false
 	// lastAssistantContent tracks the most recent non-empty text the LLM produced
 	// alongside tool calls. If the LLM later returns empty content with no tool
 	// calls (e.g. after an append_file housekeeping call), we fall back to this
@@ -695,8 +724,40 @@ func (al *AgentLoop) runLLMIteration(
 			})
 
 		// Call LLM with fallback chain if candidates are configured.
+		// On the first iteration (no prior tool calls), attempt streaming delivery
+		// when streamDeliveryFn is available. If streaming returns tool calls,
+		// fall through to normal iteration for subsequent calls.
 		var response *providers.LLMResponse
 		var err error
+
+		// Attempt streaming on first iteration when no tools have been called yet
+		// and a streaming delivery function is available.
+		if streamDeliveryFn != nil && iteration == 1 && !overLimit {
+			var streamContent string
+			var didStream bool
+			streamContent, didStream, err = streamDeliveryFn(ctx, messages, providerToolDefs)
+			if err == nil && didStream {
+				// Streaming succeeded and delivered content — we're done
+				finalContent = streamContent
+				streamedAlready = true
+				logger.InfoCF("agent", "Streaming delivery completed",
+					map[string]any{
+						"agent_id":      agent.ID,
+						"iteration":     iteration,
+						"content_chars": len(finalContent),
+					})
+				break
+			}
+			// Streaming failed or returned tool calls — fall through to normal Chat
+			if err != nil {
+				logger.WarnCF("agent", "Streaming failed, falling back to normal Chat",
+					map[string]any{
+						"agent_id": agent.ID,
+						"error":    err.Error(),
+					})
+				err = nil // reset error, will use normal Chat
+			}
+		}
 
 		callLLM := func() (*providers.LLMResponse, error) {
 			if len(agent.Candidates) > 1 && al.fallback != nil {
@@ -724,6 +785,11 @@ func (al *AgentLoop) runLLMIteration(
 				"temperature":      agent.Temperature,
 				"prompt_cache_key": agent.ID,
 			})
+		}
+
+		// Skip normal callLLM if we already broke out via streaming
+		if streamedAlready {
+			break
 		}
 
 		// Retry loop for context/token errors
@@ -798,7 +864,7 @@ func (al *AgentLoop) runLLMIteration(
 					"iteration": iteration,
 					"error":     err.Error(),
 				})
-			return "", iteration, fmt.Errorf("LLM call failed after retries: %w", err)
+			return "", iteration, false, fmt.Errorf("LLM call failed after retries: %w", err)
 		}
 
 		go al.handleReasoning(ctx, response.Reasoning, opts.Channel, al.targetReasoningChannelID(opts.Channel))
@@ -1008,10 +1074,68 @@ func (al *AgentLoop) runLLMIteration(
 			})
 	}
 
-	return finalContent, iteration, nil
+	return finalContent, iteration, streamedAlready, nil
 }
 
-// updateToolContexts updates the context for tools that need channel/chatID info.
+// doStreamDelivery performs streaming LLM call + Telegram progressive message editing.
+// Returns (content, streamed, error).
+// streamed=true means content was delivered to the channel; caller must NOT publish it again.
+// If the model returns tool calls, streamed=false and caller should handle normally.
+func (al *AgentLoop) doStreamDelivery(
+	ctx context.Context,
+	agent *AgentInstance,
+	sc channels.StreamingCapable,
+	channelName, chatID string,
+	messages []providers.Message,
+	toolDefs []providers.ToolDefinition,
+	sp providers.StreamingProvider,
+) (content string, streamed bool, err error) {
+	// Consume any pending placeholder so Manager.preSend won't try to edit it
+	// after streaming has already delivered the response.
+	if al.channelManager != nil {
+		al.channelManager.ConsumePlaceholder(channelName, chatID)
+	}
+
+	var finalResp *providers.LLMResponse
+
+	streamErr := sc.SendStreaming(ctx, chatID, func(edit func(text string)) error {
+		var accumulated strings.Builder
+
+		finalResp, err = sp.StreamChat(
+			ctx,
+			messages,
+			toolDefs,
+			agent.Model,
+			map[string]any{
+				"max_tokens":       agent.MaxTokens,
+				"temperature":      agent.Temperature,
+				"prompt_cache_key": agent.ID,
+			},
+			func(chunk string) {
+				accumulated.WriteString(chunk)
+				edit(accumulated.String())
+			},
+		)
+		return err
+	})
+
+	if streamErr != nil {
+		return "", false, streamErr
+	}
+	if finalResp == nil {
+		return "", false, nil
+	}
+
+	// If tool calls returned, streaming delivered partial content but we need
+	// to continue the tool loop — signal not-streamed so caller handles it.
+	if len(finalResp.ToolCalls) > 0 {
+		return finalResp.Content, false, nil
+	}
+
+	return finalResp.Content, true, nil
+}
+
+
 func (al *AgentLoop) updateToolContexts(agent *AgentInstance, channel, chatID string) {
 	// Use ContextualTool interface instead of type assertions
 	if tool, ok := agent.Tools.Get("message"); ok {

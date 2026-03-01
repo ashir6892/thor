@@ -39,6 +39,75 @@ import (
 	"thor/pkg/tools"
 )
 
+// readRestartContext reads RESTART_CONTEXT.md and builds a startup notification message.
+// If an intentional restart context is found, it returns a rich message and clears the file.
+// Otherwise returns the generic "back online" message.
+func readRestartContext(workspacePath string) string {
+	contextFile := filepath.Join(workspacePath, "memory", "RESTART_CONTEXT.md")
+	data, err := os.ReadFile(contextFile)
+	if err != nil {
+		return "⚡ Thor is back online!\n\nJust reply to continue! 🦞"
+	}
+
+	content := string(data)
+
+	// Extract the "## Last Restart" section
+	sectionIdx := strings.Index(content, "## Last Restart")
+	if sectionIdx == -1 {
+		return "⚡ Thor is back online!\n\nJust reply to continue! 🦞"
+	}
+
+	section := content[sectionIdx:]
+
+	// Helper to extract a field value
+	extractField := func(fieldName string) string {
+		marker := "**" + fieldName + "**"
+		idx := strings.Index(section, marker)
+		if idx == -1 {
+			return ""
+		}
+		line := section[idx+len(marker):]
+		// Remove leading ": " or " "
+		line = strings.TrimPrefix(line, ":")
+		line = strings.TrimSpace(line)
+		// Take only first line
+		if nl := strings.Index(line, "\n"); nl >= 0 {
+			line = line[:nl]
+		}
+		return strings.TrimSpace(line)
+	}
+
+	reason := extractField("Reason:")
+	task := extractField("Task:")
+	progress := extractField("Progress:")
+	expected := extractField("Expected After Restart:")
+	restartTime := extractField("Time:")
+	status := extractField("Status:")
+
+	// Check if this is a real restart context (not the placeholder)
+	if reason == "" || strings.Contains(reason, "none yet") {
+		return "⚡ Thor is back online!\n⚠️ Unplanned restart detected.\n📋 Check logs: pm2 logs thor\n\nJust reply to continue! 🦞"
+	}
+
+	// Build rich message
+	msg := fmt.Sprintf("⚡ Thor restarted itself!\n\n🔧 Reason: %s\n📌 Task: %s\n✅ Progress: %s\n🎯 Expected: %s\n📊 Status: %s\n🕐 Time: %s\n\nJust reply to continue! 🦞",
+		reason, task, progress, expected, status, restartTime)
+
+	// Clear the restart context so next restart shows as unplanned if not written
+	clearContent := `# Restart Context
+
+This file is written by Thor BEFORE intentionally restarting itself.
+The startup notification reads this file and sends a detailed report to Telegram.
+
+## Last Restart
+
+_(none yet — this file is updated by Thor before each intentional restart)_
+`
+	_ = os.WriteFile(contextFile, []byte(clearContent), 0644)
+
+	return msg
+}
+
 func gatewayCmd(debug bool) error {
 	if debug {
 		logger.SetLevel(logger.DEBUG)
@@ -201,7 +270,7 @@ func gatewayCmd(debug bool) error {
 		if err := msgBus.PublishOutbound(notifyCtx, bus.OutboundMessage{
 			Channel: primaryChannel,
 			ChatID:  primaryChatID,
-			Content: "⚡ Thor is back online!",
+			Content: readRestartContext(cfg.WorkspacePath()),
 		}); err != nil {
 			logger.WarnCF("gateway", "Failed to send startup notification", map[string]any{
 				"channel": primaryChannel,

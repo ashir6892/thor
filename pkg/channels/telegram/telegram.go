@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mymmrac/telego"
@@ -546,6 +547,85 @@ func (c *TelegramChannel) downloadFile(ctx context.Context, fileID, ext string) 
 	}
 
 	return c.downloadFileWithInfo(file, ext)
+}
+
+// SendStreaming implements channels.StreamingCapable.
+// It sends an initial placeholder message ("✍️ _thinking..._"), then
+// progressively edits it as the streamFn calls the edit callback.
+// A background goroutine throttles edits to ≤1 per 600ms to stay well
+// within Telegram's ~20 edits/min rate limit.
+// On completion a final edit commits the fully-formatted HTML response.
+func (c *TelegramChannel) SendStreaming(ctx context.Context, chatID string, streamFn func(edit func(text string)) error) error {
+	cid, err := parseChatID(chatID)
+	if err != nil {
+		return fmt.Errorf("SendStreaming: invalid chat ID %s: %w", chatID, err)
+	}
+
+	// Send placeholder
+	sent, err := c.bot.SendMessage(ctx, tu.Message(tu.ID(cid), "✍️ _thinking..._").WithParseMode(telego.ModeMarkdown))
+	if err != nil {
+		return fmt.Errorf("SendStreaming: failed to send placeholder: %w", err)
+	}
+	msgID := sent.MessageID
+
+	var mu sync.Mutex
+	var buf strings.Builder
+	lastEdit := time.Now().Add(-1 * time.Second) // allow first edit immediately
+
+	doEdit := func() {
+		mu.Lock()
+		content := buf.String()
+		mu.Unlock()
+		if content == "" {
+			return
+		}
+		htmlContent := markdownToTelegramHTML(content)
+		editParams := &telego.EditMessageTextParams{
+			ChatID:    tu.ID(cid),
+			MessageID: msgID,
+			Text:      htmlContent,
+			ParseMode: telego.ModeHTML,
+		}
+		if _, editErr := c.bot.EditMessageText(ctx, editParams); editErr != nil {
+			// Silently swallow edit errors (e.g. message not modified) — not fatal
+			logger.DebugCF("telegram", "SendStreaming edit error (non-fatal)", map[string]any{
+				"error": editErr.Error(),
+			})
+		}
+	}
+
+	editFn := func(text string) {
+		mu.Lock()
+		buf.Reset()
+		buf.WriteString(text)
+		mu.Unlock()
+	}
+
+	// Periodic edit goroutine — fires every 600ms
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(600 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if time.Since(lastEdit) >= 500*time.Millisecond {
+					doEdit()
+					lastEdit = time.Now()
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	streamErr := streamFn(editFn)
+	close(done)
+
+	// Final edit with fully-accumulated content
+	doEdit()
+
+	return streamErr
 }
 
 func parseChatID(chatIDStr string) (int64, error) {
