@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -795,8 +796,31 @@ func (al *AgentLoop) runLLMIteration(
 		// Retry loop for context/token errors
 		maxRetries := 2
 		for retry := 0; retry <= maxRetries; retry++ {
+			llmStart := time.Now()
 			response, err = callLLM()
+			llmDuration := time.Since(llmStart)
 			if err == nil {
+				// Log response time metrics to ~/.thor/metrics/response_times.log
+				go func(dur time.Duration, model string, resp *providers.LLMResponse) {
+					metricsDir := os.ExpandEnv("$HOME/.thor/metrics")
+					if mkErr := os.MkdirAll(metricsDir, 0755); mkErr == nil {
+						logPath := filepath.Join(metricsDir, "response_times.log")
+						tokens := 0
+						if resp != nil && resp.Usage != nil {
+							tokens = resp.Usage.TotalTokens
+						}
+						entry := fmt.Sprintf("%s provider=%s duration=%.2fs tokens=%d\n",
+							time.Now().UTC().Format(time.RFC3339),
+							model,
+							dur.Seconds(),
+							tokens,
+						)
+						if f, fErr := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); fErr == nil {
+							_, _ = f.WriteString(entry)
+							f.Close()
+						}
+					}
+				}(llmDuration, agent.Model, response)
 				break
 			}
 

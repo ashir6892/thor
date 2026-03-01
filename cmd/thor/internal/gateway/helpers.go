@@ -39,14 +39,116 @@ import (
 	"thor/pkg/tools"
 )
 
+// tailLines returns the last n lines from a string.
+func tailLines(s string, n int) []string {
+	lines := strings.Split(strings.TrimRight(s, "\n"), "\n")
+	if len(lines) <= n {
+		return lines
+	}
+	return lines[len(lines)-n:]
+}
+
+// diagnoseUnplannedRestart reads PM2 log files and returns a human-readable
+// diagnosis of why Thor restarted unexpectedly.
+func diagnoseUnplannedRestart() string {
+	const errLogPath = "/data/data/com.termux/files/home/.thor/logs/thor-err.log"
+	const outLogPath = "/data/data/com.termux/files/home/.thor/logs/thor-out.log"
+
+	errData, errReadErr := os.ReadFile(errLogPath)
+	outData, outReadErr := os.ReadFile(outLogPath)
+
+	// If we can't read either log, fall back gracefully.
+	if errReadErr != nil && outReadErr != nil {
+		return "Unknown restart reason (logs unreadable)"
+	}
+
+	// Work with the last 50 err lines and last 20 out lines.
+	errLines := tailLines(string(errData), 50)
+	outLines := tailLines(string(outData), 20)
+
+	combined := strings.Join(errLines, "\n") + "\n" + strings.Join(outLines, "\n")
+	combinedLower := strings.ToLower(combined)
+
+	// --- Detection rules (most specific first) ---
+
+	// safe-deploy
+	if strings.Contains(combinedLower, "safe-deploy") ||
+		strings.Contains(combinedLower, "deploying new thor binary") ||
+		strings.Contains(combinedLower, "safe deploy") {
+		return "Restarted via safe-deploy ✅"
+	}
+
+	// panic / runtime error
+	if strings.Contains(combinedLower, "panic:") || strings.Contains(combinedLower, "runtime error") {
+		// Find the first panic line for context.
+		for _, l := range errLines {
+			ll := strings.ToLower(l)
+			if strings.Contains(ll, "panic:") || strings.Contains(ll, "runtime error") {
+				trimmed := strings.TrimSpace(l)
+				if len(trimmed) > 120 {
+					trimmed = trimmed[:120] + "…"
+				}
+				return "Crashed: PANIC — " + trimmed
+			}
+		}
+		return "Crashed: PANIC (see logs)"
+	}
+
+	// OOM / killed by OS
+	if strings.Contains(combinedLower, "signal: killed") ||
+		strings.Contains(combinedLower, "out of memory") ||
+		strings.Contains(combinedLower, "oom") {
+		return "Killed by OS (OOM or signal)"
+	}
+
+	// Clean shutdown then restart
+	if strings.Contains(combinedLower, "shutting down") {
+		return "Clean shutdown then restart"
+	}
+
+	// Fatal / exit
+	if strings.Contains(combinedLower, "fatal error") || strings.Contains(combinedLower, "exit status") {
+		for _, l := range errLines {
+			ll := strings.ToLower(l)
+			if strings.Contains(ll, "fatal error") || strings.Contains(ll, "exit status") {
+				trimmed := strings.TrimSpace(l)
+				if len(trimmed) > 120 {
+					trimmed = trimmed[:120] + "…"
+				}
+				return "Fatal error — " + trimmed
+			}
+		}
+	}
+
+	// Unknown — show last 5 err lines as context.
+	lastFew := errLines
+	if len(lastFew) > 5 {
+		lastFew = lastFew[len(lastFew)-5:]
+	}
+	// Filter out blank lines.
+	var nonBlank []string
+	for _, l := range lastFew {
+		if strings.TrimSpace(l) != "" {
+			nonBlank = append(nonBlank, strings.TrimSpace(l))
+		}
+	}
+	if len(nonBlank) == 0 {
+		return "Unknown restart reason (no recent error output)"
+	}
+	return "Unknown reason — last log lines:\n" + strings.Join(nonBlank, "\n")
+}
+
 // readRestartContext reads RESTART_CONTEXT.md and builds a startup notification message.
 // If an intentional restart context is found, it returns a rich message and clears the file.
-// Otherwise returns the generic "back online" message.
+// Otherwise it auto-diagnoses the restart cause from PM2 logs.
 func readRestartContext(workspacePath string) string {
 	contextFile := filepath.Join(workspacePath, "memory", "RESTART_CONTEXT.md")
 	data, err := os.ReadFile(contextFile)
 	if err != nil {
-		return "⚡ Thor is back online!\n\nJust reply to continue! 🦞"
+		// No context file at all — diagnose from logs.
+		diagnosis := diagnoseUnplannedRestart()
+		now := time.Now().Format("2006-01-02 15:04")
+		return fmt.Sprintf("⚡ Thor is back online!\n🔍 Restart reason: %s\n🕐 Time: %s\n\nJust reply to continue! 🦞", diagnosis, now)
 	}
 
 	content := string(data)
@@ -54,7 +156,9 @@ func readRestartContext(workspacePath string) string {
 	// Extract the "## Last Restart" section
 	sectionIdx := strings.Index(content, "## Last Restart")
 	if sectionIdx == -1 {
-		return "⚡ Thor is back online!\n\nJust reply to continue! 🦞"
+		diagnosis := diagnoseUnplannedRestart()
+		now := time.Now().Format("2006-01-02 15:04")
+		return fmt.Sprintf("⚡ Thor is back online!\n🔍 Restart reason: %s\n🕐 Time: %s\n\nJust reply to continue! 🦞", diagnosis, now)
 	}
 
 	section := content[sectionIdx:]
@@ -86,10 +190,13 @@ func readRestartContext(workspacePath string) string {
 
 	// Check if this is a real restart context (not the placeholder)
 	if reason == "" || strings.Contains(reason, "none yet") {
-		return "⚡ Thor is back online!\n⚠️ Unplanned restart detected.\n📋 Check logs: pm2 logs thor\n\nJust reply to continue! 🦞"
+		// No intentional context written — diagnose from logs.
+		diagnosis := diagnoseUnplannedRestart()
+		now := time.Now().Format("2006-01-02 15:04")
+		return fmt.Sprintf("⚡ Thor is back online!\n🔍 Restart reason: %s\n🕐 Time: %s\n\nJust reply to continue! 🦞", diagnosis, now)
 	}
 
-	// Build rich message
+	// Build rich message for intentional restart
 	msg := fmt.Sprintf("⚡ Thor restarted itself!\n\n🔧 Reason: %s\n📌 Task: %s\n✅ Progress: %s\n🎯 Expected: %s\n📊 Status: %s\n🕐 Time: %s\n\nJust reply to continue! 🦞",
 		reason, task, progress, expected, status, restartTime)
 
