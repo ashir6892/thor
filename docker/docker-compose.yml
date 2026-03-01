@@ -1,0 +1,34 @@
+services:
+  # ─────────────────────────────────────────────
+  # Thor Agent (one-shot query)
+  #   docker compose -f docker/docker-compose.yml run --rm thor-agent -m "Hello"
+  # ─────────────────────────────────────────────
+  thor-agent:
+    image: docker.io/ashir6892/thor:latest
+    container_name: thor-agent
+    profiles:
+      - agent
+    # Uncomment to access host network; leave commented unless needed.
+    #extra_hosts:
+    #  - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/root/.thor
+    entrypoint: ["thor", "agent"]
+    stdin_open: true
+    tty: true
+
+  # ─────────────────────────────────────────────
+  # Thor Gateway (Long-running Bot)
+  #   docker compose -f docker/docker-compose.yml up thor-gateway
+  # ─────────────────────────────────────────────
+  thor-gateway:
+    image: docker.io/ashir6892/thor:latest
+    container_name: thor-gateway
+    restart: on-failure
+    profiles:
+      - gateway
+    # Uncomment to access host network; leave commented unless needed.
+    #extra_hosts:
+    #  - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data:/root/.thor
